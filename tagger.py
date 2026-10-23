@@ -431,8 +431,7 @@ def main() -> None:
     n_failed = 0
     n_skipped = 0
 
-    print("タグ付き済みを含む全件の再タグ付けを開始します...\n" if args.retag_all
-          else "タグなしブックマークの自動タグ付けを開始します...\n")
+    print("対象となるブックマークの件数を算出しています...")
 
     # 処理前に対象を全ページ分集める。処理中にタグが付くと検索結果が
     # 詰まってページ送りでずれるため、取得と更新を分離する。
@@ -463,7 +462,10 @@ def main() -> None:
         if len(items) < 50:
             break
         page += 1
+        print(f"\r  取得中: {len(candidates)}件", end="", flush=True)
         time.sleep(0.5)   # Raindrop API のレート制限（毎分120リクエスト）対策
+    if page:
+        print()
 
     candidates = candidates[args.start:]
     if args.limit:
@@ -471,6 +473,10 @@ def main() -> None:
     target = f"（最大 {args.limit}件）" if args.limit else "（全件）"
     kind = "ブックマーク（タグ付き含む）" if args.include_tagged else "タグなしブックマーク"
     print(f"{kind}: {len(candidates)}件 {target}\n")
+
+    if not candidates:
+        print("対象のブックマークがありません。")
+        return
 
     if args.retag_all and not args.dry_run and not args.yes and candidates:
         if args.replace:
@@ -483,8 +489,15 @@ def main() -> None:
             return
         print()
 
-    if args.replace and not args.dry_run and candidates:
+    if args.replace and not args.dry_run:
         print(f"バックアップを保存しました: {write_backup(candidates)}\n")
+
+    if args.retag_all:
+        print("タグ付き済みを含む全件の再タグ付けを開始します...\n")
+    elif args.include_tagged:
+        print("タグ付き済みを含めて、比較用のタグ生成を開始します...\n")
+    else:
+        print("タグなしブックマークの自動タグ付けを開始します...\n")
 
     # ── 各ブックマークを処理 ──
     try:
