@@ -17,6 +17,7 @@ import re
 import sys
 import time
 import argparse
+from urllib.parse import urlparse
 from collections import Counter
 from datetime import datetime
 
@@ -31,7 +32,7 @@ RAINDROP_TOKEN = os.environ.get("RAINDROP_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 DEFAULT_MODEL = "claude-haiku-5-5"
-DEFAULT_VOCAB_SIZE = 100
+DEFAULT_VOCAB_SIZE = 300
 
 # タグ生成のシステムプロンプト（全リクエストで共通 → プロンプトキャッシュで節約）
 SYSTEM_PROMPT = """\
@@ -45,7 +46,7 @@ SYSTEM_PROMPT = """\
 - サイト名・媒体名（例: Speaker Deck, note）はタグにしない
 - 括弧・中黒などの記号を含むタグは作らない
 - カンマ（,）区切りの1行だけで返す。JSON・コードブロック・箇条書き・説明文は禁止
-- 本文が読み取れない場合も、タイトルとURLから推測して同じ形式で返す
+- 情報が乏しいときは、確実に言えるタグだけを返す（推測で固有名詞を作らない）
 
 例:
 タイトル: Pythonでデータ分析を始めよう
@@ -60,8 +61,10 @@ VOCAB_PROMPT = """
 既存タグの使い方:
 - 内容に合う既存タグがあれば、新しい表記を作らず、一覧の表記そのままで使う
   （例: 一覧に Gartner があるなら ガートナー とは書かない）
-- 一覧に無い製品名・組織名・技術名などの固有名詞は、新しいタグとして追加してよい
-- 一覧にある汎用タグだけで済ませず、内容を特徴づける具体的なタグも含める\
+- 一覧に無い製品名・組織名・技術名などの固有名詞は、1件しか使われなくても新しいタグとして追加してよい
+- 一般名詞を組み合わせた新しい複合語（例: 「AI」＋名詞）は作らない。
+  既存タグか、より一般的な語を使い、細かい違いは固有名詞で表す
+- 一覧にある汎用タグだけで済ませず、内容を特徴づけるタグも含める\
 """
 
 
@@ -246,8 +249,39 @@ _BROWSER_UA = (
 )
 
 
-def fetch_page_content(url: str) -> tuple[str, str, str]:
-    """URLからタイトル・概要・本文を取得する。失敗時は空文字を返す。"""
+# HTTP 200 で返ってくるエラーページ・ボット対策画面の判定用
+_ERROR_TITLE_RE = re.compile(
+    r"^\s*(404|403|410|500|503)\b|not found|forbidden|access denied|just a moment"
+    r"|attention required|ページが見つかりません|ページは(存在|見つかり)|お探しのページ"
+    r"|アクセスが拒否|アクセスできません",
+    re.IGNORECASE,
+)
+_ERROR_BODY_RE = re.compile(
+    r"\b404\b|not found|access denied|enable javascript|are you a robot|captcha"
+    r"|ページが見つかりません|お探しのページ|見つかりませんでした|JavaScript を?有効"
+    r"|ロボットではありません",
+    re.IGNORECASE,
+)
+
+
+def detect_page_problem(url: str, final_url: str, title: str, body: str) -> str:
+    """取得したページがエラー画面・転送先のトップページ等なら、その理由を返す。正常なら空文字。"""
+    if _ERROR_TITLE_RE.search(title):
+        return f"エラーページの可能性（タイトル: {title[:30]}）"
+    # エラーページは本文が短い。長い記事の本文中の「404」などは誤検知しない
+    if len(body) < 800 and _ERROR_BODY_RE.search(body[:300]):
+        return "エラーページ・アクセス制限の可能性"
+    if urlparse(url).path.strip("/") and not urlparse(final_url).path.strip("/"):
+        return "トップページへ転送された（記事が削除された可能性）"
+    return ""
+
+
+def fetch_page_content(url: str) -> tuple[str, str, str, str]:
+    """URLからタイトル・概要・本文・問題の理由を取得する。
+
+    問題がなければ4番目は空文字。問題がある場合（取得失敗・エラーページ等）は
+    タイトル・概要・本文を空にして、理由を返す。
+    """
     try:
         resp = requests.get(
             url,
@@ -268,11 +302,26 @@ def fetch_page_content(url: str) -> tuple[str, str, str]:
         )
         description = (meta.get("content", "") or "").strip() if meta else ""
 
-        body = " ".join(soup.get_text(separator=" ", strip=True).split())
-        return title, description, body[:3000]
+        body = " ".join(soup.get_text(separator=" ", strip=True).split())[:3000]
 
-    except Exception:
-        return "", "", ""
+        problem = detect_page_problem(url, resp.url, title, body)
+        if problem:
+            return "", "", "", problem
+        return title, description, body, ""
+
+    except requests.exceptions.HTTPError as e:
+        return "", "", "", f"取得失敗（HTTP {e.response.status_code}）"
+    except Exception as e:
+        return "", "", "", f"取得失敗（{type(e).__name__}）"
+
+
+_MIN_BODY_LEN = 100
+_MIN_DESC_LEN = 40
+
+
+def is_informative(description: str, body: str) -> bool:
+    """タグ生成に足る情報（本文または概要）があるか。"""
+    return len(body) >= _MIN_BODY_LEN or len(description) >= _MIN_DESC_LEN
 
 
 # ──────────────────────────────────────────────
@@ -430,6 +479,7 @@ def main() -> None:
     n_success = 0
     n_failed = 0
     n_skipped = 0
+    skipped_pages = []   # (url, 理由, タイトル): 情報不足でスキップしたもの
 
     print("対象となるブックマークの件数を算出しています...")
 
@@ -514,8 +564,23 @@ def main() -> None:
                 print(f"     {domain}")
 
             # ウェブページ取得
-            page_title, description, body = fetch_page_content(url)
+            page_title, description, body, problem = fetch_page_content(url)
             effective_title = page_title or title
+
+            # ページが使えない／概要が無いときは、Raindrop が保存している概要で補う
+            excerpt = (bm.get("excerpt") or "").strip()
+            if problem or not description:
+                description = excerpt
+
+            # 情報が足りなければ推測でタグを作らず、スキップ（既存タグは変更しない）
+            if not is_informative(description, body):
+                reason = problem or "ページの内容が少なく、保存済みの概要もない"
+                print(f"     ⚠️ スキップ: {reason}（タグは変更しません）\n")
+                skipped_pages.append((url, reason, title))
+                n_skipped += 1
+                continue
+            if problem:
+                print(f"     ℹ️ {problem}のため、保存済みの概要を使います")
 
             # Claude でタグ生成
             try:
@@ -576,6 +641,12 @@ def main() -> None:
     print(
         f"完了: 成功 {n_success}件 / 失敗 {n_failed}件 / スキップ {n_skipped}件"
     )
+    if skipped_pages:
+        path = f"skipped-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        with open(path, "w", encoding="utf-8") as f:
+            for u, reason, t in skipped_pages:
+                f.write(f"{u}\t{reason}\t{t}\n")
+        print(f"情報不足でスキップした{len(skipped_pages)}件の一覧: {path}")
 
 
 if __name__ == "__main__":
