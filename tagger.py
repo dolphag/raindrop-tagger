@@ -33,6 +33,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 DEFAULT_MODEL = "claude-haiku-5-5"
 DEFAULT_VOCAB_SIZE = 300
+ERROR_TAG = "[err]"   # ページを取得できなかったブックマークに付けるタグ
 
 # タグ生成のシステムプロンプト（全リクエストで共通 → プロンプトキャッシュで節約）
 SYSTEM_PROMPT = """\
@@ -432,8 +433,20 @@ def main() -> None:
         "--restore", metavar="FILE",
         help="バックアップ JSON のタグに戻す（--dry-run で内容確認のみ）"
     )
+    parser.add_argument(
+        "--error-tag", default=ERROR_TAG, metavar="TAG",
+        help=f"ページを取得できなかったブックマークに付けるタグ（空文字で付けない、デフォルト: {ERROR_TAG}）"
+    )
+    parser.add_argument(
+        "--retry-errors", action="store_true",
+        help="エラータグが付いているブックマークだけを再処理する（成功したらエラータグを外す）"
+    )
     args = parser.parse_args()
 
+    if args.retry_errors and (args.retag_all or args.include_tagged or args.replace or args.start):
+        parser.error("--retry-errors は --retag-all / --include-tagged / --replace / --start と同時に指定できません")
+    if args.retry_errors and not args.error_tag:
+        parser.error("--retry-errors には --error-tag の指定（空以外）が必要です")
     if args.retag_all and args.include_tagged:
         parser.error("--retag-all と --include-tagged は同時に指定できません")
     if args.include_tagged and not (args.dry_run and args.limit):
@@ -443,7 +456,7 @@ def main() -> None:
     if args.replace and not args.retag_all:
         parser.error("--replace は --retag-all と併用してください")
     # 以降、タグ付き済みも取得する動作は include_tagged に集約する
-    args.include_tagged = args.include_tagged or args.retag_all
+    args.include_tagged = args.include_tagged or args.retag_all or args.retry_errors
 
     # 環境変数チェック
     if not RAINDROP_TOKEN:
@@ -480,6 +493,7 @@ def main() -> None:
     n_failed = 0
     n_skipped = 0
     skipped_pages = []   # (url, 理由, タイトル): 情報不足でスキップしたもの
+    n_err_tagged = 0     # エラータグを付けた件数
 
     print("対象となるブックマークの件数を算出しています...")
 
@@ -505,6 +519,8 @@ def main() -> None:
             # API側の絞り込みが効かない場合に備え、タグ付き済みはここでも除外
             if (bm.get("tags") and not args.include_tagged) or bm["_id"] in seen_ids:
                 continue
+            if args.retry_errors and args.error_tag not in (bm.get("tags") or []):
+                continue
             seen_ids.add(bm["_id"])
             candidates.append(bm)
         if args.limit and len(candidates) >= args.start + args.limit:
@@ -521,7 +537,12 @@ def main() -> None:
     if args.limit:
         candidates = candidates[: args.limit]
     target = f"（最大 {args.limit}件）" if args.limit else "（全件）"
-    kind = "ブックマーク（タグ付き含む）" if args.include_tagged else "タグなしブックマーク"
+    if args.retry_errors:
+        kind = f"エラータグ（{args.error_tag}）付きブックマーク"
+    elif args.include_tagged:
+        kind = "ブックマーク（タグ付き含む）"
+    else:
+        kind = "タグなしブックマーク"
     print(f"{kind}: {len(candidates)}件 {target}\n")
 
     if not candidates:
@@ -544,6 +565,8 @@ def main() -> None:
 
     if args.retag_all:
         print("タグ付き済みを含む全件の再タグ付けを開始します...\n")
+    elif args.retry_errors:
+        print("エラータグ付きブックマークの再処理を開始します...\n")
     elif args.include_tagged:
         print("タグ付き済みを含めて、比較用のタグ生成を開始します...\n")
     else:
@@ -575,9 +598,23 @@ def main() -> None:
             # 情報が足りなければ推測でタグを作らず、スキップ（既存タグは変更しない）
             if not is_informative(description, body):
                 reason = problem or "ページの内容が少なく、保存済みの概要もない"
-                print(f"     ⚠️ スキップ: {reason}（タグは変更しません）\n")
                 skipped_pages.append((url, reason, title))
                 n_skipped += 1
+                existing = bm.get("tags") or []
+                # ページの問題（取得失敗・エラー画面等）には、エラータグだけを付ける。
+                # 既存タグは変更しない。内容が少ないだけの場合は何も変更しない
+                if problem and args.error_tag and args.error_tag not in existing:
+                    if args.dry_run:
+                        print(f"     ⚠️ スキップ: {reason}（{args.error_tag} を付ける予定）\n")
+                    elif update_bookmark_tags(bm_id, merge_tags(existing, [args.error_tag])):
+                        print(f"     ⚠️ スキップ: {reason}（{args.error_tag} を付けました）\n")
+                        n_err_tagged += 1
+                    else:
+                        print(f"     ⚠️ スキップ: {reason}（{args.error_tag} の付与に失敗）\n")
+                        n_failed += 1
+                else:
+                    print(f"     ⚠️ スキップ: {reason}（タグは変更しません）\n")
+                time.sleep(args.delay)
                 continue
             if problem:
                 print(f"     ℹ️ {problem}のため、保存済みの概要を使います")
@@ -608,14 +645,22 @@ def main() -> None:
                 if total_done % 25 == 0:
                     vocabulary = [t for t, _ in run_vocab.most_common(args.vocab_size)]
 
+            # ページに問題があった場合はエラータグも付ける。問題がなければ、
+            # 以前のエラーで付いたままのエラータグは外す
+            save_tags = tags
+            if problem and args.error_tag:
+                save_tags = tags + [args.error_tag]
+                print(f"     ⚠️ {args.error_tag} も付けます")
+
             # Raindrop.io に保存
             if not args.dry_run:
                 existing = bm.get("tags") or []
+                base = existing if problem else [t for t in existing if t != args.error_tag]
                 if args.replace:
-                    merged = tags
+                    merged = save_tags
                     unchanged = {t.casefold() for t in merged} == {t.casefold() for t in existing}
                 else:
-                    merged = merge_tags(existing, tags)
+                    merged = merge_tags(base, save_tags)
                     unchanged = merged == existing
                 if unchanged:
                     print("     ✅ 変更なし\n")
@@ -626,6 +671,8 @@ def main() -> None:
                 if ok:
                     print("     ✅ 保存完了\n")
                     n_success += 1
+                    if problem and args.error_tag:
+                        n_err_tagged += 1
                 else:
                     print("     ❌ 保存失敗\n")
                     n_failed += 1
@@ -641,6 +688,8 @@ def main() -> None:
     print(
         f"完了: 成功 {n_success}件 / 失敗 {n_failed}件 / スキップ {n_skipped}件"
     )
+    if n_err_tagged:
+        print(f"エラータグ {args.error_tag} を付けた件数: {n_err_tagged}件")
     if skipped_pages:
         path = f"skipped-{datetime.now():%Y%m%d-%H%M%S}.txt"
         with open(path, "w", encoding="utf-8") as f:
