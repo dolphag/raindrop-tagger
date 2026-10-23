@@ -17,6 +17,8 @@ import re
 import sys
 import time
 import argparse
+from collections import Counter
+from datetime import datetime
 
 import requests
 import anthropic
@@ -176,6 +178,42 @@ def canonicalize_tags(tags: list[str], vocabulary: list[str] | None) -> list[str
     return out
 
 
+def write_backup(bookmarks: list[dict]) -> str:
+    """更新前のタグを JSON に退避し、ファイルパスを返す。(--restore で復元できる)"""
+    path = f"tag-backup-{datetime.now():%Y%m%d-%H%M%S}.json"
+    items = [
+        {"_id": b["_id"], "title": b.get("title", ""), "link": b.get("link", ""),
+         "tags": b.get("tags") or []}
+        for b in bookmarks
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"created": datetime.now().isoformat(), "items": items},
+                  f, ensure_ascii=False, indent=1)
+    return path
+
+
+def restore_from_backup(path: str, delay: float, dry_run: bool) -> None:
+    """バックアップ JSON のタグでブックマークのタグを置き換えて復元する。"""
+    with open(path, encoding="utf-8") as f:
+        items = json.load(f)["items"]
+    print(f"{path}: {len(items)}件を復元します{'（DRY RUN）' if dry_run else ''}\n")
+    n_ok = n_failed = 0
+    for i, it in enumerate(items, 1):
+        label = it.get("title") or it.get("link", "")
+        print(f"[{i}] {label[:70]}{'…' if len(label) > 70 else ''}")
+        print(f"     → {', '.join(it['tags']) or '(タグなし)'}")
+        if dry_run:
+            n_ok += 1
+            continue
+        if update_bookmark_tags(it["_id"], it["tags"]):
+            n_ok += 1
+        else:
+            print("     ❌ 失敗")
+            n_failed += 1
+        time.sleep(delay)
+    print(f"\n完了: 成功 {n_ok}件 / 失敗 {n_failed}件")
+
+
 def merge_tags(existing: list[str], new: list[str]) -> list[str]:
     """既存タグを保持したまま新規タグを追加する（大文字小文字を無視して重複除去）。"""
     merged = list(existing)
@@ -325,15 +363,46 @@ def main() -> None:
         "--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE,
         help=f"プロンプトに渡す既存タグの件数（使用頻度順。0=渡さない、デフォルト: {DEFAULT_VOCAB_SIZE}）"
     )
+    parser.add_argument(
+        "--retag-all", action="store_true",
+        help="タグ付き済みも含めて全件を再タグ付けし、既存タグにマージして保存する"
+    )
+    parser.add_argument(
+        "--start", type=int, default=0,
+        help="先頭からスキップする件数（--retag-all の中断後の再開用。デフォルト: 0）"
+    )
+    parser.add_argument(
+        "--yes", action="store_true", help="--retag-all の実行前確認を省略する"
+    )
+    parser.add_argument(
+        "--replace", action="store_true",
+        help="--retag-all と併用: 既存タグを消して、生成したタグに置き換える"
+             "（更新前のタグは tag-backup-*.json に退避）"
+    )
+    parser.add_argument(
+        "--restore", metavar="FILE",
+        help="バックアップ JSON のタグに戻す（--dry-run で内容確認のみ）"
+    )
     args = parser.parse_args()
 
+    if args.retag_all and args.include_tagged:
+        parser.error("--retag-all と --include-tagged は同時に指定できません")
     if args.include_tagged and not (args.dry_run and args.limit):
         parser.error("--include-tagged は --dry-run と --limit を併用してください")
+    if args.start and not args.retag_all:
+        parser.error("--start は --retag-all と併用してください")
+    if args.replace and not args.retag_all:
+        parser.error("--replace は --retag-all と併用してください")
+    # 以降、タグ付き済みも取得する動作は include_tagged に集約する
+    args.include_tagged = args.include_tagged or args.retag_all
 
     # 環境変数チェック
     if not RAINDROP_TOKEN:
         print("Error: RAINDROP_TOKEN が設定されていません。.env ファイルを確認してください。")
         sys.exit(1)
+    if args.restore:
+        restore_from_backup(args.restore, args.delay, args.dry_run)
+        return
     if not ANTHROPIC_API_KEY:
         print("Error: ANTHROPIC_API_KEY が設定されていません。.env ファイルを確認してください。")
         sys.exit(1)
@@ -341,7 +410,13 @@ def main() -> None:
     client = anthropic.Anthropic()
 
     vocabulary = []
-    if args.vocab_size > 0:
+    run_vocab = Counter()   # --replace 時: 今回の実行で生成したタグの出現数
+    if args.replace:
+        # 既存タグは作り直す対象なので語彙として使わない。実行中に生成したタグから
+        # 語彙を育てて、表記ゆれを抑える（25件ごとに更新）
+        if args.vocab_size > 0:
+            print("--replace: 既存タグは語彙に使わず、今回生成したタグから語彙を作ります\n")
+    elif args.vocab_size > 0:
         try:
             vocabulary = get_tag_vocabulary(args.collection, args.vocab_size)
             print(f"既存タグ {len(vocabulary)}件をプロンプトに渡します\n")
@@ -356,7 +431,8 @@ def main() -> None:
     n_failed = 0
     n_skipped = 0
 
-    print("タグなしブックマークの自動タグ付けを開始します...\n")
+    print("タグ付き済みを含む全件の再タグ付けを開始します...\n" if args.retag_all
+          else "タグなしブックマークの自動タグ付けを開始します...\n")
 
     # 処理前に対象を全ページ分集める。処理中にタグが付くと検索結果が
     # 詰まってページ送りでずれるため、取得と更新を分離する。
@@ -382,72 +458,106 @@ def main() -> None:
                 continue
             seen_ids.add(bm["_id"])
             candidates.append(bm)
-        if args.limit and len(candidates) >= args.limit:
+        if args.limit and len(candidates) >= args.start + args.limit:
             break
         if len(items) < 50:
             break
         page += 1
+        time.sleep(0.5)   # Raindrop API のレート制限（毎分120リクエスト）対策
 
+    candidates = candidates[args.start:]
     if args.limit:
         candidates = candidates[: args.limit]
     target = f"（最大 {args.limit}件）" if args.limit else "（全件）"
     kind = "ブックマーク（タグ付き含む）" if args.include_tagged else "タグなしブックマーク"
     print(f"{kind}: {len(candidates)}件 {target}\n")
 
-    # ── 各ブックマークを処理 ──
-    for bm in candidates:
-        bm_id = bm["_id"]
-        title = bm.get("title", "")
-        url = bm.get("link", "")
-        domain = bm.get("domain", "")
-        total_done += 1
-
-        label = title or url
-        print(f"[{total_done}] {label[:70]}{'…' if len(label) > 70 else ''}")
-        if domain:
-            print(f"     {domain}")
-
-        # ウェブページ取得
-        page_title, description, body = fetch_page_content(url)
-        effective_title = page_title or title
-
-        # Claude でタグ生成
-        try:
-            tags = generate_tags(
-                client, url, effective_title, description, body,
-                model=args.model, vocabulary=vocabulary, domain=domain,
-            )
-        except anthropic.APIError as e:
-            print(f"     ❌ Claude API エラー: {e}\n")
-            n_failed += 1
-            time.sleep(1)
-            continue
-
-        if not tags:
-            print("     ⚠️ タグを生成できませんでした\n")
-            n_skipped += 1
-            continue
-
-        if args.include_tagged:
-            print(f"     既存: {', '.join(bm.get('tags') or []) or '(なし)'}")
-        print(f"     🏷️  {', '.join(tags)}")
-
-        # Raindrop.io に保存
-        if not args.dry_run:
-            ok = update_bookmark_tags(
-                bm_id, merge_tags(bm.get("tags") or [], tags)
-            )
-            if ok:
-                print("     ✅ 保存完了\n")
-                n_success += 1
-            else:
-                print("     ❌ 保存失敗\n")
-                n_failed += 1
+    if args.retag_all and not args.dry_run and not args.yes and candidates:
+        if args.replace:
+            print(f"{len(candidates)}件の既存タグを削除し、生成したタグに置き換えます。")
+            print("（更新前のタグは tag-backup-*.json に保存します）")
         else:
-            print("     [DRY RUN] スキップ\n")
-            n_success += 1
+            print(f"{len(candidates)}件のタグ付けを行い、既存タグにマージして保存します。")
+        if input("続行しますか？ (y/N): ").strip().lower() != "y":
+            print("中止しました。")
+            return
+        print()
 
-        time.sleep(args.delay)
+    if args.replace and not args.dry_run and candidates:
+        print(f"バックアップを保存しました: {write_backup(candidates)}\n")
+
+    # ── 各ブックマークを処理 ──
+    try:
+        for bm in candidates:
+            bm_id = bm["_id"]
+            title = bm.get("title", "")
+            url = bm.get("link", "")
+            domain = bm.get("domain", "")
+            total_done += 1
+
+            label = title or url
+            print(f"[{args.start + total_done}] {label[:70]}{'…' if len(label) > 70 else ''}")
+            if domain:
+                print(f"     {domain}")
+
+            # ウェブページ取得
+            page_title, description, body = fetch_page_content(url)
+            effective_title = page_title or title
+
+            # Claude でタグ生成
+            try:
+                tags = generate_tags(
+                    client, url, effective_title, description, body,
+                    model=args.model, vocabulary=vocabulary, domain=domain,
+                )
+            except anthropic.APIError as e:
+                print(f"     ❌ Claude API エラー: {e}\n")
+                n_failed += 1
+                time.sleep(1)
+                continue
+
+            if not tags:
+                print("     ⚠️ タグを生成できませんでした\n")
+                n_skipped += 1
+                continue
+
+            if args.include_tagged:
+                print(f"     既存: {', '.join(bm.get('tags') or []) or '(なし)'}")
+            print(f"     🏷️  {', '.join(tags)}")
+
+            if args.replace and args.vocab_size > 0:
+                run_vocab.update(tags)
+                if total_done % 25 == 0:
+                    vocabulary = [t for t, _ in run_vocab.most_common(args.vocab_size)]
+
+            # Raindrop.io に保存
+            if not args.dry_run:
+                existing = bm.get("tags") or []
+                if args.replace:
+                    merged = tags
+                    unchanged = {t.casefold() for t in merged} == {t.casefold() for t in existing}
+                else:
+                    merged = merge_tags(existing, tags)
+                    unchanged = merged == existing
+                if unchanged:
+                    print("     ✅ 変更なし\n")
+                    n_success += 1
+                    time.sleep(args.delay)
+                    continue
+                ok = update_bookmark_tags(bm_id, merged)
+                if ok:
+                    print("     ✅ 保存完了\n")
+                    n_success += 1
+                else:
+                    print("     ❌ 保存失敗\n")
+                    n_failed += 1
+            else:
+                print("     [DRY RUN] スキップ\n")
+                n_success += 1
+
+            time.sleep(args.delay)
+    except KeyboardInterrupt:
+        print(f"\n中断しました。再開するには --start {args.start + total_done - 1} を指定してください（他のオプションは同じものを指定）。")
 
     print("=" * 50)
     print(

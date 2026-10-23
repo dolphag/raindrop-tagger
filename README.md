@@ -57,6 +57,21 @@ python tagger.py --limit 10
 # タグ付き済みも対象に、既存タグと新タグを並べて比較（保存しない。--dry-run と --limit が必須）
 python tagger.py --dry-run --include-tagged --limit 20
 
+# タグ付き済みも含めて全件を再タグ付けし、既存タグにマージして保存（実行前に確認あり）
+python tagger.py --retag-all
+
+# 件数を絞って試す / 確認を省略 / 中断後に途中から再開（--start は先頭からのスキップ件数）
+python tagger.py --retag-all --limit 20
+python tagger.py --retag-all --yes
+python tagger.py --retag-all --start 300
+
+# 既存タグを消して付け直す（更新前のタグは tag-backup-*.json に自動保存。既存タグは語彙に使わない）
+python tagger.py --retag-all --replace --dry-run --limit 20   # まず保存せずに確認
+python tagger.py --retag-all --replace
+
+# バックアップのタグに戻す（--dry-run で内容確認のみ）
+python tagger.py --restore tag-backup-20261023-091931.json
+
 # タグ生成モデルを指定（デフォルト: claude-haiku-5-5）。モデル比較に便利
 python tagger.py --dry-run --include-tagged --limit 20 --model claude-haiku-5-5
 
