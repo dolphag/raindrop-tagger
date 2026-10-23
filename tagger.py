@@ -26,7 +26,8 @@ load_dotenv()
 RAINDROP_TOKEN = os.environ.get("RAINDROP_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-DEFAULT_MODEL = "claude-haiku-4-5"
+DEFAULT_MODEL = "claude-haiku-5-5"
+DEFAULT_VOCAB_SIZE = 100
 
 # タグ生成のシステムプロンプト（全リクエストで共通 → プロンプトキャッシュで節約）
 SYSTEM_PROMPT = """\
@@ -37,6 +38,8 @@ SYSTEM_PROMPT = """\
 - タグは最大5個まで
 - 日本語または英語（内容に合わせて選択）
 - 1〜3語の短い単語・フレーズのみ
+- サイト名・媒体名（例: Speaker Deck, note）はタグにしない
+- 括弧・中黒などの記号を含むタグは作らない
 - カンマ（,）区切りで返す
 - タグ以外は何も返さない（説明文や記号は不要）
 
@@ -44,6 +47,25 @@ SYSTEM_PROMPT = """\
 タイトル: Pythonでデータ分析を始めよう
 出力: Python,データ分析,pandas,機械学習,チュートリアル\
 """
+
+VOCAB_PROMPT = """
+
+既存タグ一覧（使用頻度の高い順）:
+{vocab}
+
+既存タグの使い方:
+- 内容に合う既存タグがあれば、新しい表記を作らず、一覧の表記そのままで使う
+  （例: 一覧に Gartner があるなら ガートナー とは書かない）
+- 一覧に無い製品名・組織名・技術名などの固有名詞は、新しいタグとして追加してよい
+- 一覧にある汎用タグだけで済ませず、内容を特徴づける具体的なタグも含める\
+"""
+
+
+def build_system_prompt(vocabulary: list[str] | None) -> str:
+    """既存タグ一覧があればシステムプロンプトに組み込む。"""
+    if not vocabulary:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + VOCAB_PROMPT.format(vocab=", ".join(vocabulary))
 
 
 # ──────────────────────────────────────────────
@@ -76,6 +98,31 @@ def get_untagged_bookmarks(
     resp.raise_for_status()
     data = resp.json()
     return data.get("items", []), data.get("count", 0)
+
+
+def get_tag_vocabulary(collection_id: int = 0, top_n: int = DEFAULT_VOCAB_SIZE) -> list[str]:
+    """既存タグを使用頻度の高い順に top_n 件取得する。(collection_id=0 → 全コレクション)"""
+    resp = requests.get(
+        f"https://api.raindrop.io/rest/v1/tags/{collection_id}",
+        headers=_raindrop_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    items = resp.json().get("items", [])
+    items.sort(key=lambda x: x.get("count", 0), reverse=True)
+    return [it["_id"] for it in items[:top_n]]
+
+
+def canonicalize_tags(tags: list[str], vocabulary: list[str] | None) -> list[str]:
+    """既存タグと大文字小文字だけ違うものを既存の表記に揃え、重複を除く。"""
+    canon = {v.casefold(): v for v in (vocabulary or [])}
+    out, seen = [], set()
+    for t in tags:
+        t = canon.get(t.casefold(), t)
+        if t.casefold() not in seen:
+            seen.add(t.casefold())
+            out.append(t)
+    return out
 
 
 def merge_tags(existing: list[str], new: list[str]) -> list[str]:
@@ -150,6 +197,7 @@ def generate_tags(
     description: str,
     content: str,
     model: str = DEFAULT_MODEL,
+    vocabulary: list[str] | None = None,
 ) -> list[str]:
     """Claude API を使ってタグを生成する。システムプロンプトをキャッシュ。"""
     parts = []
@@ -174,7 +222,7 @@ def generate_tags(
         system=[
             {
                 "type": "text",
-                "text": SYSTEM_PROMPT,
+                "text": build_system_prompt(vocabulary),
                 "cache_control": {"type": "ephemeral"},  # 全リクエストで再利用
             }
         ],
@@ -183,7 +231,7 @@ def generate_tags(
 
     raw = next((b.text for b in message.content if b.type == "text"), "").strip()
     tags = [t.strip() for t in raw.split(",") if t.strip()]
-    return tags[:5]
+    return canonicalize_tags(tags, vocabulary)[:5]
 
 
 # ──────────────────────────────────────────────
@@ -216,6 +264,10 @@ def main() -> None:
         "--include-tagged", action="store_true",
         help="タグ付き済みも対象にする（比較用。--dry-run と --limit が必須）"
     )
+    parser.add_argument(
+        "--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE,
+        help=f"プロンプトに渡す既存タグの件数（使用頻度順。0=渡さない、デフォルト: {DEFAULT_VOCAB_SIZE}）"
+    )
     args = parser.parse_args()
 
     if args.include_tagged and not (args.dry_run and args.limit):
@@ -230,6 +282,14 @@ def main() -> None:
         sys.exit(1)
 
     client = anthropic.Anthropic()
+
+    vocabulary = []
+    if args.vocab_size > 0:
+        try:
+            vocabulary = get_tag_vocabulary(args.collection, args.vocab_size)
+            print(f"既存タグ {len(vocabulary)}件をプロンプトに渡します\n")
+        except requests.exceptions.RequestException as e:
+            print(f"既存タグの取得に失敗しました（渡さずに続行します）: {e}\n")
 
     if args.dry_run:
         print("[DRY RUN モード] タグは保存されません\n")
@@ -297,7 +357,8 @@ def main() -> None:
         # Claude でタグ生成
         try:
             tags = generate_tags(
-                client, url, effective_title, description, body, model=args.model
+                client, url, effective_title, description, body,
+                model=args.model, vocabulary=vocabulary,
             )
         except anthropic.APIError as e:
             print(f"     ❌ Claude API エラー: {e}\n")

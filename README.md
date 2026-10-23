@@ -57,7 +57,7 @@ python tagger.py --limit 10
 # タグ付き済みも対象に、既存タグと新タグを並べて比較（保存しない。--dry-run と --limit が必須）
 python tagger.py --dry-run --include-tagged --limit 20
 
-# タグ生成モデルを指定（デフォルト: claude-haiku-4-5）。モデル比較に便利
+# タグ生成モデルを指定（デフォルト: claude-haiku-5-5）。モデル比較に便利
 python tagger.py --dry-run --include-tagged --limit 20 --model claude-haiku-5-5
 
 # 特定コレクションのみ処理（コレクションIDを指定）
@@ -102,5 +102,6 @@ python tagger.py --dry-run --limit 5
 ## 注意事項
 
 - `.env` ファイルは `.gitignore` 済みですが、APIキーを含むため取り扱いに注意してください。
-- タグ生成には `claude-haiku-4-5` を使用し、システムプロンプトはプロンプトキャッシュで再利用してコストを抑えています。
+- タグ生成には `claude-haiku-5-5` を使用します（`--model` で変更可）。
+- Raindrop.io の既存タグを使用頻度の高い順に取得（デフォルト100件、`--vocab-size` で変更、0で無効）してプロンプトに渡し、表記ゆれ（例: Gartner / ガートナー）を抑えます。システムプロンプトはプロンプトキャッシュの対象です。
 - ページ取得に失敗したブックマーク（アクセス不可・タイムアウトなど）でも、URLとタイトルのみからタグ生成を試みます。
