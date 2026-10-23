@@ -11,7 +11,9 @@ raindrop-tagger: Raindrop.io のブックマークにウェブページ内容を
                                   # タグ付き済みも対象に、既存タグと新タグを比較（保存しない）
 """
 
+import json
 import os
+import re
 import sys
 import time
 import argparse
@@ -40,8 +42,8 @@ SYSTEM_PROMPT = """\
 - 1〜3語の短い単語・フレーズのみ
 - サイト名・媒体名（例: Speaker Deck, note）はタグにしない
 - 括弧・中黒などの記号を含むタグは作らない
-- カンマ（,）区切りで返す
-- タグ以外は何も返さない（説明文や記号は不要）
+- カンマ（,）区切りの1行だけで返す。JSON・コードブロック・箇条書き・説明文は禁止
+- 本文が読み取れない場合も、タイトルとURLから推測して同じ形式で返す
 
 例:
 タイトル: Pythonでデータ分析を始めよう
@@ -113,6 +115,55 @@ def get_tag_vocabulary(collection_id: int = 0, top_n: int = DEFAULT_VOCAB_SIZE) 
     return [it["_id"] for it in items[:top_n]]
 
 
+_BAD_TAG_CHARS = set('{}[]"`')
+_MAX_TAG_LEN = 40
+
+
+def parse_tags(raw: str) -> list[str] | None:
+    """モデルの出力をタグのリストにする。形式が崩れていれば None を返す。"""
+    text = raw.strip()
+    fence = re.fullmatch(r"```[a-zA-Z]*\n?(.*?)\n?```", text, flags=re.S)
+    if fence:
+        text = fence.group(1).strip()
+
+    if text[:1] in "{[":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        if isinstance(data, dict):
+            data = data.get("tags")
+        if isinstance(data, str):
+            data = data.split(",")
+        if not isinstance(data, list):
+            return None
+        items = [str(t) for t in data]
+    else:
+        # 正常な出力は短い1行。改行や長文は説明文が混じっているとみなす
+        if "\n" in text or len(text) > 150:
+            return None
+        items = text.split(",")
+
+    tags = []
+    for t in (i.strip() for i in items):
+        if t and len(t) <= _MAX_TAG_LEN and not (_BAD_TAG_CHARS & set(t)):
+            tags.append(t)
+    return tags
+
+
+def drop_site_name_tags(tags: list[str], domain: str, vocabulary: list[str] | None) -> list[str]:
+    """ドメイン名と一致するタグ（サイト名・媒体名）を除く。既存タグにあるものは残す。"""
+    dom = domain.casefold().replace("-", "")
+    known = set(vocabulary or [])
+    out = []
+    for t in tags:
+        key = t.casefold().replace(" ", "")
+        if len(key) >= 3 and key in dom and t not in known:
+            continue
+        out.append(t)
+    return out
+
+
 def canonicalize_tags(tags: list[str], vocabulary: list[str] | None) -> list[str]:
     """既存タグと大文字小文字だけ違うものを既存の表記に揃え、重複を除く。"""
     canon = {v.casefold(): v for v in (vocabulary or [])}
@@ -168,7 +219,7 @@ def fetch_page_content(url: str) -> tuple[str, str, str]:
         )
         resp.raise_for_status()
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(resp.content, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
             tag.decompose()
 
@@ -198,6 +249,7 @@ def generate_tags(
     content: str,
     model: str = DEFAULT_MODEL,
     vocabulary: list[str] | None = None,
+    domain: str = "",
 ) -> list[str]:
     """Claude API を使ってタグを生成する。システムプロンプトをキャッシュ。"""
     parts = []
@@ -215,23 +267,28 @@ def generate_tags(
     if model.startswith("claude-haiku-5"):
         extra = {"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}}
 
-    message = client.messages.create(
-        model=model,   # バッチタグ付けはコスト効率重視
-        max_tokens=128,
-        **extra,
-        system=[
-            {
-                "type": "text",
-                "text": build_system_prompt(vocabulary),
-                "cache_control": {"type": "ephemeral"},  # 全リクエストで再利用
-            }
-        ],
-        messages=[{"role": "user", "content": "\n".join(parts)}],
-    )
-
-    raw = next((b.text for b in message.content if b.type == "text"), "").strip()
-    tags = [t.strip() for t in raw.split(",") if t.strip()]
-    return canonicalize_tags(tags, vocabulary)[:5]
+    # 出力形式が崩れた場合は1回だけ再試行し、それでも崩れていれば空を返す
+    # （壊れた文字列をタグとして保存しないため）
+    for _ in range(2):
+        message = client.messages.create(
+            model=model,   # バッチタグ付けはコスト効率重視
+            max_tokens=128,
+            **extra,
+            system=[
+                {
+                    "type": "text",
+                    "text": build_system_prompt(vocabulary),
+                    "cache_control": {"type": "ephemeral"},  # 全リクエストで再利用
+                }
+            ],
+            messages=[{"role": "user", "content": "\n".join(parts)}],
+        )
+        raw = next((b.text for b in message.content if b.type == "text"), "")
+        tags = parse_tags(raw)
+        if tags is not None:
+            tags = drop_site_name_tags(tags, domain, vocabulary)
+            return canonicalize_tags(tags, vocabulary)[:5]
+    return []
 
 
 # ──────────────────────────────────────────────
@@ -358,7 +415,7 @@ def main() -> None:
         try:
             tags = generate_tags(
                 client, url, effective_title, description, body,
-                model=args.model, vocabulary=vocabulary,
+                model=args.model, vocabulary=vocabulary, domain=domain,
             )
         except anthropic.APIError as e:
             print(f"     ❌ Claude API エラー: {e}\n")
