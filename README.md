@@ -65,6 +65,13 @@ python tagger.py --retag-all --limit 20
 python tagger.py --retag-all --yes
 python tagger.py --retag-all --start 300
 
+# 既存タグを消して付け直す（更新前のタグは tag-backup-*.json に自動保存。既存タグは語彙に使わない）
+python tagger.py --retag-all --replace --dry-run --limit 20   # まず保存せずに確認
+python tagger.py --retag-all --replace
+
+# バックアップのタグに戻す（--dry-run で内容確認のみ）
+python tagger.py --restore tag-backup-20261023-091931.json
+
 # タグ生成モデルを指定（デフォルト: claude-haiku-5-5）。モデル比較に便利
 python tagger.py --dry-run --include-tagged --limit 20 --model claude-haiku-5-5
 

@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# --replace が作るバックアップ（ブックマークの内容を含むためコミットしない）
+tag-backup-*.json
