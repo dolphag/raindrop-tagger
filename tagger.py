@@ -325,10 +325,27 @@ def main() -> None:
         "--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE,
         help=f"プロンプトに渡す既存タグの件数（使用頻度順。0=渡さない、デフォルト: {DEFAULT_VOCAB_SIZE}）"
     )
+    parser.add_argument(
+        "--retag-all", action="store_true",
+        help="タグ付き済みも含めて全件を再タグ付けし、既存タグにマージして保存する"
+    )
+    parser.add_argument(
+        "--start", type=int, default=0,
+        help="先頭からスキップする件数（--retag-all の中断後の再開用。デフォルト: 0）"
+    )
+    parser.add_argument(
+        "--yes", action="store_true", help="--retag-all の実行前確認を省略する"
+    )
     args = parser.parse_args()
 
+    if args.retag_all and args.include_tagged:
+        parser.error("--retag-all と --include-tagged は同時に指定できません")
     if args.include_tagged and not (args.dry_run and args.limit):
         parser.error("--include-tagged は --dry-run と --limit を併用してください")
+    if args.start and not args.retag_all:
+        parser.error("--start は --retag-all と併用してください")
+    # 以降、タグ付き済みも取得する動作は include_tagged に集約する
+    args.include_tagged = args.include_tagged or args.retag_all
 
     # 環境変数チェック
     if not RAINDROP_TOKEN:
@@ -356,7 +373,8 @@ def main() -> None:
     n_failed = 0
     n_skipped = 0
 
-    print("タグなしブックマークの自動タグ付けを開始します...\n")
+    print("タグ付き済みを含む全件の再タグ付けを開始します...\n" if args.retag_all
+          else "タグなしブックマークの自動タグ付けを開始します...\n")
 
     # 処理前に対象を全ページ分集める。処理中にタグが付くと検索結果が
     # 詰まってページ送りでずれるため、取得と更新を分離する。
@@ -382,72 +400,89 @@ def main() -> None:
                 continue
             seen_ids.add(bm["_id"])
             candidates.append(bm)
-        if args.limit and len(candidates) >= args.limit:
+        if args.limit and len(candidates) >= args.start + args.limit:
             break
         if len(items) < 50:
             break
         page += 1
+        time.sleep(0.5)   # Raindrop API のレート制限（毎分120リクエスト）対策
 
+    candidates = candidates[args.start:]
     if args.limit:
         candidates = candidates[: args.limit]
     target = f"（最大 {args.limit}件）" if args.limit else "（全件）"
     kind = "ブックマーク（タグ付き含む）" if args.include_tagged else "タグなしブックマーク"
     print(f"{kind}: {len(candidates)}件 {target}\n")
 
+    if args.retag_all and not args.dry_run and not args.yes and candidates:
+        print(f"{len(candidates)}件のタグ付けを行い、既存タグにマージして保存します。")
+        if input("続行しますか？ (y/N): ").strip().lower() != "y":
+            print("中止しました。")
+            return
+        print()
+
     # ── 各ブックマークを処理 ──
-    for bm in candidates:
-        bm_id = bm["_id"]
-        title = bm.get("title", "")
-        url = bm.get("link", "")
-        domain = bm.get("domain", "")
-        total_done += 1
+    try:
+        for bm in candidates:
+            bm_id = bm["_id"]
+            title = bm.get("title", "")
+            url = bm.get("link", "")
+            domain = bm.get("domain", "")
+            total_done += 1
 
-        label = title or url
-        print(f"[{total_done}] {label[:70]}{'…' if len(label) > 70 else ''}")
-        if domain:
-            print(f"     {domain}")
+            label = title or url
+            print(f"[{args.start + total_done}] {label[:70]}{'…' if len(label) > 70 else ''}")
+            if domain:
+                print(f"     {domain}")
 
-        # ウェブページ取得
-        page_title, description, body = fetch_page_content(url)
-        effective_title = page_title or title
+            # ウェブページ取得
+            page_title, description, body = fetch_page_content(url)
+            effective_title = page_title or title
 
-        # Claude でタグ生成
-        try:
-            tags = generate_tags(
-                client, url, effective_title, description, body,
-                model=args.model, vocabulary=vocabulary, domain=domain,
-            )
-        except anthropic.APIError as e:
-            print(f"     ❌ Claude API エラー: {e}\n")
-            n_failed += 1
-            time.sleep(1)
-            continue
-
-        if not tags:
-            print("     ⚠️ タグを生成できませんでした\n")
-            n_skipped += 1
-            continue
-
-        if args.include_tagged:
-            print(f"     既存: {', '.join(bm.get('tags') or []) or '(なし)'}")
-        print(f"     🏷️  {', '.join(tags)}")
-
-        # Raindrop.io に保存
-        if not args.dry_run:
-            ok = update_bookmark_tags(
-                bm_id, merge_tags(bm.get("tags") or [], tags)
-            )
-            if ok:
-                print("     ✅ 保存完了\n")
-                n_success += 1
-            else:
-                print("     ❌ 保存失敗\n")
+            # Claude でタグ生成
+            try:
+                tags = generate_tags(
+                    client, url, effective_title, description, body,
+                    model=args.model, vocabulary=vocabulary, domain=domain,
+                )
+            except anthropic.APIError as e:
+                print(f"     ❌ Claude API エラー: {e}\n")
                 n_failed += 1
-        else:
-            print("     [DRY RUN] スキップ\n")
-            n_success += 1
+                time.sleep(1)
+                continue
 
-        time.sleep(args.delay)
+            if not tags:
+                print("     ⚠️ タグを生成できませんでした\n")
+                n_skipped += 1
+                continue
+
+            if args.include_tagged:
+                print(f"     既存: {', '.join(bm.get('tags') or []) or '(なし)'}")
+            print(f"     🏷️  {', '.join(tags)}")
+
+            # Raindrop.io に保存
+            if not args.dry_run:
+                existing = bm.get("tags") or []
+                merged = merge_tags(existing, tags)
+                if merged == existing:
+                    print("     ✅ 変更なし\n")
+                    n_success += 1
+                    time.sleep(args.delay)
+                    continue
+                ok = update_bookmark_tags(bm_id, merged)
+                if ok:
+                    print("     ✅ 保存完了\n")
+                    n_success += 1
+                else:
+                    print("     ❌ 保存失敗\n")
+                    n_failed += 1
+            else:
+                print("     [DRY RUN] スキップ\n")
+                n_success += 1
+
+            time.sleep(args.delay)
+    except KeyboardInterrupt:
+        print(f"\n中断しました。再開するには --start {args.start + total_done - 1} を指定してください。")
 
     print("=" * 50)
     print(

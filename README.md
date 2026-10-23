@@ -57,6 +57,14 @@ python tagger.py --limit 10
 # タグ付き済みも対象に、既存タグと新タグを並べて比較（保存しない。--dry-run と --limit が必須）
 python tagger.py --dry-run --include-tagged --limit 20
 
+# タグ付き済みも含めて全件を再タグ付けし、既存タグにマージして保存（実行前に確認あり）
+python tagger.py --retag-all
+
+# 件数を絞って試す / 確認を省略 / 中断後に途中から再開（--start は先頭からのスキップ件数）
+python tagger.py --retag-all --limit 20
+python tagger.py --retag-all --yes
+python tagger.py --retag-all --start 300
+
 # タグ生成モデルを指定（デフォルト: claude-haiku-5-5）。モデル比較に便利
 python tagger.py --dry-run --include-tagged --limit 20 --model claude-haiku-5-5
 
