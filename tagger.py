@@ -54,7 +54,7 @@ def get_untagged_bookmarks(collection_id: int = 0, page: int = 0, per_page: int 
     """タグなしブックマークを取得する。(collection_id=0 → 全コレクション)"""
     resp = requests.get(
         f"https://api.raindrop.io/rest/v1/raindrops/{collection_id}",
-        params={"notag": "true", "perpage": per_page, "page": page},
+        params={"search": "notag:true", "perpage": per_page, "page": page},
         headers=_raindrop_headers(),
         timeout=15,
     )
@@ -63,8 +63,19 @@ def get_untagged_bookmarks(collection_id: int = 0, page: int = 0, per_page: int 
     return data.get("items", []), data.get("count", 0)
 
 
+def merge_tags(existing: list[str], new: list[str]) -> list[str]:
+    """既存タグを保持したまま新規タグを追加する（大文字小文字を無視して重複除去）。"""
+    merged = list(existing)
+    seen = {t.lower() for t in existing}
+    for t in new:
+        if t.lower() not in seen:
+            merged.append(t)
+            seen.add(t.lower())
+    return merged
+
+
 def update_bookmark_tags(bookmark_id: int, tags: list[str]) -> bool:
-    """ブックマークのタグを更新する。"""
+    """ブックマークのタグを更新する。tags は最終的な全タグ（既存タグ込み）。"""
     resp = requests.put(
         f"https://api.raindrop.io/rest/v1/raindrop/{bookmark_id}",
         json={"tags": tags},
@@ -189,7 +200,6 @@ def main() -> None:
     if args.dry_run:
         print("[DRY RUN モード] タグは保存されません\n")
 
-    page = 0
     total_done = 0
     n_success = 0
     n_failed = 0
@@ -197,80 +207,88 @@ def main() -> None:
 
     print("タグなしブックマークの自動タグ付けを開始します...\n")
 
+    # 処理前に対象を全ページ分集める。処理中にタグが付くと検索結果が
+    # 詰まってページ送りでずれるため、取得と更新を分離する。
+    candidates = []
+    seen_ids = set()
+    page = 0
     while True:
-        # ── ページ取得 ──
         try:
-            bookmarks, total_count = get_untagged_bookmarks(
+            items, total_count = get_untagged_bookmarks(
                 collection_id=args.collection, page=page
             )
         except requests.exceptions.RequestException as e:
             print(f"Raindrop.io API エラー: {e}")
             break
 
-        if page == 0:
-            target = f"（最大 {args.limit}件）" if args.limit else "（全件）"
-            print(f"タグなしブックマーク: {total_count}件 {target}\n")
-
-        if not bookmarks:
+        if not items:
             break
-
-        # ── 各ブックマークを処理 ──
-        for bm in bookmarks:
-            if args.limit and total_done >= args.limit:
-                break
-
-            bm_id = bm["_id"]
-            title = bm.get("title", "")
-            url = bm.get("link", "")
-            domain = bm.get("domain", "")
-            total_done += 1
-
-            label = title or url
-            print(f"[{total_done}] {label[:70]}{'…' if len(label) > 70 else ''}")
-            if domain:
-                print(f"     {domain}")
-
-            # ウェブページ取得
-            page_title, description, body = fetch_page_content(url)
-            effective_title = page_title or title
-
-            # Claude でタグ生成
-            try:
-                tags = generate_tags(client, url, effective_title, description, body)
-            except anthropic.APIError as e:
-                print(f"     ❌ Claude API エラー: {e}\n")
-                n_failed += 1
-                time.sleep(1)
+        for bm in items:
+            # API側の絞り込みが効かない場合に備え、タグ付き済みはここでも除外
+            if bm.get("tags") or bm["_id"] in seen_ids:
                 continue
-
-            if not tags:
-                print("     ⚠️ タグを生成できませんでした\n")
-                n_skipped += 1
-                continue
-
-            print(f"     🏷️  {', '.join(tags)}")
-
-            # Raindrop.io に保存
-            if not args.dry_run:
-                ok = update_bookmark_tags(bm_id, tags)
-                if ok:
-                    print("     ✅ 保存完了\n")
-                    n_success += 1
-                else:
-                    print("     ❌ 保存失敗\n")
-                    n_failed += 1
-            else:
-                print("     [DRY RUN] スキップ\n")
-                n_success += 1
-
-            time.sleep(args.delay)
-
-        # ── 次ページ or 終了 ──
-        if args.limit and total_done >= args.limit:
+            seen_ids.add(bm["_id"])
+            candidates.append(bm)
+        if args.limit and len(candidates) >= args.limit:
             break
-        if len(bookmarks) < 50:
+        if len(items) < 50:
             break
         page += 1
+
+    if args.limit:
+        candidates = candidates[: args.limit]
+    target = f"（最大 {args.limit}件）" if args.limit else "（全件）"
+    print(f"タグなしブックマーク: {len(candidates)}件 {target}\n")
+
+    # ── 各ブックマークを処理 ──
+    for bm in candidates:
+        bm_id = bm["_id"]
+        title = bm.get("title", "")
+        url = bm.get("link", "")
+        domain = bm.get("domain", "")
+        total_done += 1
+
+        label = title or url
+        print(f"[{total_done}] {label[:70]}{'…' if len(label) > 70 else ''}")
+        if domain:
+            print(f"     {domain}")
+
+        # ウェブページ取得
+        page_title, description, body = fetch_page_content(url)
+        effective_title = page_title or title
+
+        # Claude でタグ生成
+        try:
+            tags = generate_tags(client, url, effective_title, description, body)
+        except anthropic.APIError as e:
+            print(f"     ❌ Claude API エラー: {e}\n")
+            n_failed += 1
+            time.sleep(1)
+            continue
+
+        if not tags:
+            print("     ⚠️ タグを生成できませんでした\n")
+            n_skipped += 1
+            continue
+
+        print(f"     🏷️  {', '.join(tags)}")
+
+        # Raindrop.io に保存
+        if not args.dry_run:
+            ok = update_bookmark_tags(
+                bm_id, merge_tags(bm.get("tags") or [], tags)
+            )
+            if ok:
+                print("     ✅ 保存完了\n")
+                n_success += 1
+            else:
+                print("     ❌ 保存失敗\n")
+                n_failed += 1
+        else:
+            print("     [DRY RUN] スキップ\n")
+            n_success += 1
+
+        time.sleep(args.delay)
 
     print("=" * 50)
     print(
