@@ -7,6 +7,8 @@ raindrop-tagger: Raindrop.io のブックマークにウェブページ内容を
     python tagger.py --dry-run    # タグを保存せずプレビュー
     python tagger.py --limit 10   # 最大10件だけ処理
     python tagger.py --collection 12345  # 特定コレクションのみ処理
+    python tagger.py --dry-run --include-tagged --limit 20 --model claude-haiku-5-5
+                                  # タグ付き済みも対象に、既存タグと新タグを比較（保存しない）
 """
 
 import os
@@ -23,6 +25,8 @@ load_dotenv()
 
 RAINDROP_TOKEN = os.environ.get("RAINDROP_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+DEFAULT_MODEL = "claude-haiku-4-5"
 
 # タグ生成のシステムプロンプト（全リクエストで共通 → プロンプトキャッシュで節約）
 SYSTEM_PROMPT = """\
@@ -50,11 +54,22 @@ def _raindrop_headers() -> dict:
     return {"Authorization": f"Bearer {RAINDROP_TOKEN}"}
 
 
-def get_untagged_bookmarks(collection_id: int = 0, page: int = 0, per_page: int = 50):
-    """タグなしブックマークを取得する。(collection_id=0 → 全コレクション)"""
+def get_untagged_bookmarks(
+    collection_id: int = 0,
+    page: int = 0,
+    per_page: int = 50,
+    include_tagged: bool = False,
+):
+    """タグなしブックマークを取得する。(collection_id=0 → 全コレクション)
+
+    include_tagged=True の場合は絞り込まず、タグ付き済みも含めて取得する。
+    """
+    params = {"perpage": per_page, "page": page}
+    if not include_tagged:
+        params["search"] = "notag:true"
     resp = requests.get(
         f"https://api.raindrop.io/rest/v1/raindrops/{collection_id}",
-        params={"search": "notag:true", "perpage": per_page, "page": page},
+        params=params,
         headers=_raindrop_headers(),
         timeout=15,
     )
@@ -134,6 +149,7 @@ def generate_tags(
     title: str,
     description: str,
     content: str,
+    model: str = DEFAULT_MODEL,
 ) -> list[str]:
     """Claude API を使ってタグを生成する。システムプロンプトをキャッシュ。"""
     parts = []
@@ -145,9 +161,16 @@ def generate_tags(
     if content:
         parts.append(f"本文（抜粋）: {content[:2000]}")
 
+    # Haiku 5.x は思考がデフォルトで有効（max_tokens を消費する）ため、
+    # タグ付けでは無効化する。4.x はこれらのパラメータの扱いが異なるので付けない。
+    extra = {}
+    if model.startswith("claude-haiku-5"):
+        extra = {"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}}
+
     message = client.messages.create(
-        model="claude-haiku-4-5",   # バッチタグ付けはコスト効率重視
+        model=model,   # バッチタグ付けはコスト効率重視
         max_tokens=128,
+        **extra,
         system=[
             {
                 "type": "text",
@@ -158,7 +181,7 @@ def generate_tags(
         messages=[{"role": "user", "content": "\n".join(parts)}],
     )
 
-    raw = message.content[0].text.strip()
+    raw = next((b.text for b in message.content if b.type == "text"), "").strip()
     tags = [t.strip() for t in raw.split(",") if t.strip()]
     return tags[:5]
 
@@ -185,7 +208,18 @@ def main() -> None:
         "--delay", type=float, default=0.5,
         help="リクエスト間の待機秒数（デフォルト: 0.5）"
     )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL,
+        help=f"タグ生成に使うモデルID（デフォルト: {DEFAULT_MODEL}）"
+    )
+    parser.add_argument(
+        "--include-tagged", action="store_true",
+        help="タグ付き済みも対象にする（比較用。--dry-run と --limit が必須）"
+    )
     args = parser.parse_args()
+
+    if args.include_tagged and not (args.dry_run and args.limit):
+        parser.error("--include-tagged は --dry-run と --limit を併用してください")
 
     # 環境変数チェック
     if not RAINDROP_TOKEN:
@@ -215,7 +249,9 @@ def main() -> None:
     while True:
         try:
             items, total_count = get_untagged_bookmarks(
-                collection_id=args.collection, page=page
+                collection_id=args.collection,
+                page=page,
+                include_tagged=args.include_tagged,
             )
         except requests.exceptions.RequestException as e:
             print(f"Raindrop.io API エラー: {e}")
@@ -225,7 +261,7 @@ def main() -> None:
             break
         for bm in items:
             # API側の絞り込みが効かない場合に備え、タグ付き済みはここでも除外
-            if bm.get("tags") or bm["_id"] in seen_ids:
+            if (bm.get("tags") and not args.include_tagged) or bm["_id"] in seen_ids:
                 continue
             seen_ids.add(bm["_id"])
             candidates.append(bm)
@@ -238,7 +274,8 @@ def main() -> None:
     if args.limit:
         candidates = candidates[: args.limit]
     target = f"（最大 {args.limit}件）" if args.limit else "（全件）"
-    print(f"タグなしブックマーク: {len(candidates)}件 {target}\n")
+    kind = "ブックマーク（タグ付き含む）" if args.include_tagged else "タグなしブックマーク"
+    print(f"{kind}: {len(candidates)}件 {target}\n")
 
     # ── 各ブックマークを処理 ──
     for bm in candidates:
@@ -259,7 +296,9 @@ def main() -> None:
 
         # Claude でタグ生成
         try:
-            tags = generate_tags(client, url, effective_title, description, body)
+            tags = generate_tags(
+                client, url, effective_title, description, body, model=args.model
+            )
         except anthropic.APIError as e:
             print(f"     ❌ Claude API エラー: {e}\n")
             n_failed += 1
@@ -271,6 +310,8 @@ def main() -> None:
             n_skipped += 1
             continue
 
+        if args.include_tagged:
+            print(f"     既存: {', '.join(bm.get('tags') or []) or '(なし)'}")
         print(f"     🏷️  {', '.join(tags)}")
 
         # Raindrop.io に保存
