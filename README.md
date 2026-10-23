@@ -15,7 +15,8 @@ Raindrop.io のタグなしブックマークを取得し、ページ内容（�
 ### 1. 依存パッケージのインストール
 
 ```bash
-pip install -r requirements.txt
+# pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ### 2. API キーの設定
