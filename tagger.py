@@ -39,7 +39,7 @@ SYSTEM_PROMPT = """\
 ルール:
 - タグは最大5個まで
 - 日本語または英語（内容に合わせて選択）
-- 1〜3語の短い単語・フレーズのみ
+- 1〜3語の短い単語・フレーズのみ（1つのタグは25文字以内。タイトルや文をそのままタグにしない）
 - サイト名・媒体名（例: Speaker Deck, note）はタグにしない
 - 括弧・中黒などの記号を含むタグは作らない
 - カンマ（,）区切りの1行だけで返す。JSON・コードブロック・箇条書き・説明文は禁止
@@ -116,7 +116,7 @@ def get_tag_vocabulary(collection_id: int = 0, top_n: int = DEFAULT_VOCAB_SIZE) 
 
 
 _BAD_TAG_CHARS = set('{}[]"`')
-_MAX_TAG_LEN = 40
+_MAX_TAG_LEN = 25
 
 
 def parse_tags(raw: str) -> list[str] | None:
