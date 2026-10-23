@@ -54,6 +54,12 @@ python tagger.py --dry-run
 # 最大10件だけ処理
 python tagger.py --limit 10
 
+# タグ付き済みも対象に、既存タグと新タグを並べて比較（保存しない。--dry-run と --limit が必須）
+python tagger.py --dry-run --include-tagged --limit 20
+
+# タグ生成モデルを指定（デフォルト: claude-haiku-4-5）。モデル比較に便利
+python tagger.py --dry-run --include-tagged --limit 20 --model claude-haiku-5-5
+
 # 特定コレクションのみ処理（コレクションIDを指定）
 python tagger.py --collection 12345
 
